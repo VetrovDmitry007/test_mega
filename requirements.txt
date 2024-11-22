@@ -1,4 +1,4 @@
-pandas==2.2.2
+pandas
 tqdm==4.66.4
 geopy==2.4.1
 catboost==1.2.7

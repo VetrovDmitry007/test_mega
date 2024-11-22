@@ -101,6 +101,6 @@ def get_opt_tilt(file_name: str):
 
 
 if __name__ == '__main__':
-    # call_sinr()
-    s = get_opt_tilt('histogram_sinr_id_1_ret.csv')
-    print(s)
+    call_sinr()
+    # s = get_opt_tilt('histogram_sinr_id_1_ret.csv')
+    # print(s)
