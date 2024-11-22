@@ -1,0 +1,6 @@
+pandas==2.2.2
+tqdm==4.66.4
+geopy==2.4.1
+catboost==1.2.7
+joblib==1.4.2
+openpyxl==3.1.5
