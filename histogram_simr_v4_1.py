@@ -1,13 +1,17 @@
+from typing import List, Dict, Tuple
+
 import pandas as pd
 from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
 from functools import partial
+
+from tqdm.contrib import itertools
 from tqdm.contrib.concurrent import process_map
 from itertools import chain
 
 from core.af_tuner_module import AntennaFeederTuner
 
-def calculate_sinr_for_chunk(chunk, tuner, id_antenn_tilt, tilt:int = 400):
+def calculate_sinr_for_chunk(chunk, tuner, id_antenn_tilt:int = 0, tilt:int = 400):
     """ Рассчитываем SINR для чанка данных с заданным наклоном.
         Аргументы приходят в виде кортежа (chunk, tuner, tilt, id_antenn_tilt)
     """
@@ -78,7 +82,7 @@ def call_sinr():
 
 def get_opt_tilt(file_name: str):
     # Пороговое значение
-    val_p = 1
+    val_p = 0
     # Словарь для хранения результатов
     results = {}
     df = pd.read_csv(file_name)
@@ -99,8 +103,107 @@ def get_opt_tilt(file_name: str):
     )
     return sorted_results
 
+def get_opt_list():
+    """ Извлечение результатов оптимизации из итоговых файлов.
+
+    """
+    firs_antenn  = 13
+    for id in range(firs_antenn, 45, 1):
+        try:
+            file_opt = f'./from_server/new/histogram_sinr_id_{id}_ret.csv'
+            dc_opt = get_opt_tilt(file_opt)
+            ls_antenn = list(dc_opt)[:4]
+            str_res = ''
+            for antenn in ls_antenn:
+                str_res += f'id_{id} - {antenn}: {dc_opt[antenn]}, '
+            # str_res +='\n'
+            print(str_res)
+        except:
+            pass
+
+
+def call_sinr_comb(antenns: List[Tuple]):
+    """
+        Для комбинации значений (antenn_id и tilt) вычисляем SINR для каждой точки из to_histogram_5x5_1800.csv
+        Результат в histogram_sinr_num_comb_{num_comb}.csv
+    """
+    tuner = AntennaFeederTuner('LTE1800')
+    df_csv: pd.DataFrame = pd.read_csv('to_histogram_5x5_1800_10km.csv')
+    # df_csv = df_csv.iloc[:500]
+    print(f'Read to_histogram_5x5_1800.csv rows: {df_csv.shape}')
+
+    # Разделение данных на чанки
+    chunk_size = len(df_csv) // cpu_count()
+    chunks = [df_csv.iloc[i:i + chunk_size] for i in range(0, len(df_csv), chunk_size)]
+
+    # Обновляем значения углов
+    for num_comb, comb_antenn in enumerate(antenns, start=1):
+        dc_sinr = {}
+        for antenn_id, tilt in comb_antenn:
+            antenn_id = int(antenn_id.split('_')[-1])
+            tuner.dc_anten_v2[antenn_id].update({'tilt': tilt})
+
+        # Подготовка функции с использованием partial
+        # Зафиксируем параметры tuner, tilt, id_antenn_tilt
+        func = partial(calculate_sinr_for_chunk, tuner=tuner)
+
+        # Использование process_map для многопроцессорной обработки с прогрессом
+        results = process_map(func, chunks, max_workers=cpu_count(), desc=f"Processing tilt")
+
+        # Сливаем все результаты в один список
+        # объединить несколько итерируемых объектов в один
+        ls_sinr_db = list(chain(*results))
+        dc_sinr.update({f'{comb_antenn}': ls_sinr_db})
+
+        # Создаем DataFrame и сохраняем в CSV
+        df_sinr = pd.DataFrame.from_dict(dc_sinr)
+        df_sinr.to_csv(f'histogram_sinr_num_comb_{num_comb}.csv', index=False)
+        print(f'Results saved to histogram_sinr_num_comb_{num_comb}.csv, {df_sinr.shape=}')
+
+
+def run_combin():
+    """ Комбинация id антенн и их углов наклона.
+    (2, 6) -- 2 это базовый угол
+
+    """
+    antennas = [
+        {'id_antenn_3': (2, 6)},
+        {'id_antenn_6': (2, 6)},
+        {'id_antenn_12': (4, 5)},
+        {'id_antenn_15': (3, 4)},
+        {'id_antenn_24': (2, 3)},
+        {'id_antenn_31': (3, 4)},
+        {'id_antenn_34': (2, 6)},
+        {'id_antenn_35': (2, 6)}
+    ]
+
+    # Получение всех возможных комбинаций наклонов
+    combinations = list(itertools.product(*[list(antenna.values())[0] for antenna in antennas]))
+    # Формирование списка словарей с нужной структурой
+    result = []
+
+    # Для каждой комбинации создаем список кортежей
+    for comb in combinations:
+        result.append((list(antennas[i].keys())[0], comb[i]) for i in range(len(antennas)))
+
+    # Вывод результата
+    ls_res_all = []
+    for res in result:
+        ls_res = []
+        for r in res:
+            ls_res.append(r)
+        # print(ls_res)
+        ls_res_all.append(ls_res)
+    print(ls_res_all)
+    return ls_res_all
+
 
 if __name__ == '__main__':
-    call_sinr()
-    # s = get_opt_tilt('histogram_sinr_id_1_ret.csv')
+    # call_sinr()
+
+    combs = run_combin()
+    call_sinr_comb(combs)
+
+    # s = get_opt_tilt('./from_server/new/histogram_sinr_id_17_ret.csv')
     # print(s)
+    # get_opt_list()
