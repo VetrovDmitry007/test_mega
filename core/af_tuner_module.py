@@ -9,6 +9,8 @@ from multiprocessing import Pool, Manager
 from catboost import CatBoostRegressor
 import joblib
 from typing import List
+import ast  # Для безопасного преобразования строк в словари
+
 
 
 class AntennaFeederTuner:
@@ -48,6 +50,10 @@ class AntennaFeederTuner:
         # Расчет корректирующего коэффициента a(h_m) для высоты антенны мобильной станции дБ
         self.a_hm = self.calculate_a_hm()
 
+        # Кэш вычисленных данных всех антенн + ds, angle
+        self.cache_antenns_params = dict()
+        # self.load_antenns_params()
+
         # Проверка наличия антенн в справочнике
         # for key, ls_antenn in self.dc_anten.items():
         #     for dc_antenn in ls_antenn:
@@ -62,6 +68,28 @@ class AntennaFeederTuner:
         self.model = CatBoostRegressor()
         self.model.load_model(f'./{model_folder}/{model_name}')
         self.scaler = joblib.load(f'./{model_folder}/scaler.pkl')
+
+    def load_antenns_params(self):
+        """ Загрузка сохранённого кэша с использованием чтения файла частями """
+        print('Старт загрузки cache_antenns_params.csv')
+        chunk_size = 100000  # Размер блока для чтения
+        file_path = './sourse_data/cache_antenns_params.csv'
+
+        # Подсчет общего количества строк для прогресса
+        with open(file_path) as f:
+            total_rows = sum(1 for _ in f) - 1  # минус строку заголовка
+
+        # Инициализация словаря для кэша
+        self.cache_antenns_params = {}
+
+        # Чтение файла частями
+        with pd.read_csv(file_path, chunksize=chunk_size) as reader:
+            for chunk in tqdm(reader, total=total_rows // chunk_size + 1, desc="Загрузка файла"):
+                for _, row in chunk.iterrows():
+                    # Преобразование строки ключа и значения
+                    key = row['key']  # Предположим, колонка с ключами называется "key"
+                    value = ast.literal_eval(row['value'])  # Безопасное преобразование строки в словарь
+                    self.cache_antenns_params[key] = value
 
     def call_rsrp_neg(self, center_lng, center_lat, antenn_id):
         """ Расчёт интерференции помех в ваттах
@@ -153,34 +181,50 @@ class AntennaFeederTuner:
         # print(f'SINR: {sinr_p}W, {sinr}dB')
         return sinr
 
-    def call_sinr_v2(self, center_lng, center_lat, ls_id_antenn, uses_tilt: bool = False):
-        """ Расчёт SINR для точки по формуле мощности сигнала антенны
-
-        :param center_lng: Координаты точки расчёта
-        :param center_lat: Координаты точки расчёта
-        :param ls_id_antenn: Список id антенн
-        :param uses_tilt: Использовать данные угла наклона антенны
-        :return: SINR в dB
+    def call_sinr_v2(self, dc_power_antenn):
         """
-        id_antenn_max = ls_id_antenn[0]
-        chisl_wat = 0
-        znam_wat = 0
+        Расчёт SINR для точки по формуле мощности сигнала антенны с учетом мультипути и затухания
 
-        for id_antenn in ls_id_antenn:
-            power_db = self.calculate_power_id(center_lng=center_lng,
-                                               center_lat=center_lat,
-                                               antenn_id=id_antenn,
-                                               new_angle=400,
-                                               uses_tilt = uses_tilt)
+        :param dc_power_antenn: Словарь антенн с указанием мощности её сигнала в данной точке
+        :return: SINR в дБ
+        """
+        # Идентификация основной антенны с максимальной мощностью
+        id_antenn_max = list(dc_power_antenn)[0]  # Основная антенна — с максимальной мощностью
+        chisl_wat = 0  # Полезная мощность
+        znam_wat = 0  # Сумма интерференции + шум
+
+        # Коэффициенты для модели Райса и затухания
+        K = 6  # Коэффициент Райса (смешанный путь)
+        wall_loss = 10  # Потери сигнала при прохождении через стены, дБ
+
+        for id_antenn, power_db in dc_power_antenn.items():
+            # Учет затухания и мультипути
+            direct_power_watt = self.dbm_2_wat(power_db)  # Прямой сигнал (Вт)
+
+            # Модель Райса (основной и отраженный сигналы)
+            reflected_power_watt = direct_power_watt * 0.1  # Предположим, отраженный сигнал слабее на 90%
+            total_power_watt = (K / (K + 1)) * direct_power_watt + (1 / (K + 1)) * reflected_power_watt
+
+            # Добавление затухания для интерферирующих антенн
+            if id_antenn != id_antenn_max:  # Для интерферирующих антенн применяем затухание
+                additional_loss_db = wall_loss  # Затухание из-за стен
+                adjusted_power_db = power_db - additional_loss_db
+                power_watt_after_loss = self.dbm_2_wat(adjusted_power_db)
+                total_power_watt = power_watt_after_loss  # Учитываем потерю сигнала
+
             if id_antenn == id_antenn_max:
-                chisl_wat += self.dbm_2_wat(power_db)
-                chisl_db = power_db
+                chisl_wat += total_power_watt  # Основная антенна
             else:
-                znam_wat += self.dbm_2_wat(power_db)
+                znam_wat += total_power_watt  # Интерференция от всех остальных антенн
 
-        sinr_wat = chisl_wat / (znam_wat + self.dbm_2_wat(-122))
-        sinr_db = self.wat_2_db(sinr_wat)
-        # return (id_antenn_max, chisl_db, sinr_db)
+        # Добавляем тепловой шум (-122 дБм) в Вт
+        thermal_noise_watt = self.dbm_2_wat(-122)  # Шум в Ваттах
+        znam_wat += thermal_noise_watt  # Добавляем шум
+
+        # Рассчитываем SINR (соотношение сигнал/помеха + шум)
+        sinr_wat = chisl_wat / (znam_wat if znam_wat > 0 else 1e-9)  # Избегаем деления на 0
+        sinr_db = self.wat_2_db(sinr_wat)  # Конвертируем SINR в дБ
+
         return sinr_db
 
     def predict_nearest_rsrp_v2(self, point_lng, point_lat, antenn_id) -> int:
@@ -486,14 +530,19 @@ class AntennaFeederTuner:
                      'center_lng': 33.4699656677246, 'center_lat': 59.6640264892578, 'angle_between': 2.45565455324097,
                      'angle_bet_grad': 140, 'ds': 3551, 'perp': None}, ..}
         """
+        # Кэш вычисленных данных всех антенн + ds, angle
+        if dc_antenn_fn := self.cache_antenns_params.get(json.dumps([center_lng, center_lat])):
+            return dc_antenn_fn
+
         dc_anten_v2 = self.dc_anten_v2
         # В dc_antenn_fn собираем антенны с их: ds, perp, angle_between для нахождения ближайшей
-        dc_antenn_fn = copy.copy(dc_anten_v2)
+        dc_antenn_fn = copy.copy(self.dc_anten_v2)
 
         for antenna_id, dc_antenn in dc_anten_v2.items():
             dc_antenn_fn[antenna_id].update({'center_lng': center_lng, 'center_lat': center_lat})
             # Находим: ds, angle_between, perp
             dc_distance = self.call_distance(**dc_antenn_fn[antenna_id])
+
             angle_between = dc_distance['angle_between']
             angle_bet_grad = dc_distance['angle_bet_grad']
             ds = dc_distance['ds']
@@ -502,6 +551,7 @@ class AntennaFeederTuner:
                                              'angle_bet_grad': int(angle_bet_grad),
                                              'ds': ds,
                                              'perp': perp})
+        self.cache_antenns_params[json.dumps([center_lng, center_lat])] = dc_antenn_fn
         return dc_antenn_fn
 
     def get_nearest_antenna(self, center_lng, center_lat, all: bool = False):
@@ -873,23 +923,23 @@ class AntennaFeederTuner:
 
     def get_max_power_id(self, latitude, longitude, all: bool = False):
         """ Нахождение антенны с максимальным сигналом / или всех отсортированных по
-        уровню сигнала
+        уровню сигнала. Возвращает id антенны и мощность сигнала в точке приёма дБм
 
         :param latitude: Координаты точки измерения (широта)
         :param longitude: Координаты точки измерения (долгота)
         :param all: Выгружать всех отсортированных по уровню сигнала
-        :return:
+        :return: {16: -142.38173284141928, 60: -145.85287237544463 ...} /или/ 16
         """
         # Получение данных всех антенны
         nearest_antenna = self.get_antenns_params(center_lng=longitude, center_lat=latitude)
         dc_power_antenn = {}
         # Для всех антенн находим мохность сигнала в точке приёма
-        for key, dc_val in nearest_antenna.items():
+        for antenn_id, dc_val in nearest_antenna.items():
             angle = dc_val['angle_bet_grad']
             tilt = dc_val['tilt']
-            A_angle_dB = self.get_angle_rotate(antenn_id=key, angle=angle)
-            # A_angle_v_dB = self.get_angle_tilt(antenn_id=key, tilt=tilt)
-            A_angle_v_dB = 0
+            A_angle_dB = self.get_angle_rotate(antenn_id=antenn_id, angle=angle)
+            A_angle_v_dB = self.get_angle_tilt(antenn_id=antenn_id, tilt=tilt)
+            # A_angle_v_dB = 0
 
             d_m = max(0.01, dc_val['ds'])
             try:
@@ -901,15 +951,14 @@ class AntennaFeederTuner:
             except ValueError as e:
                 print(f"Ошибка при расчёте мощности: {e}, данные: {dc_val}")
                 p = None
-            dc_power_antenn[key] = p
+            dc_power_antenn[antenn_id] = p
         # Выбираем антенну с максимальным сигналом
-        dc_anten = dict(sorted(dc_power_antenn.items(), key=lambda item: item[1]))
+        dc_power_antenn = dict(sorted(dc_power_antenn.items(), key=lambda item: item[1], reverse=True))
         if all:
-            id_antenn_max = list(dc_anten)[::-1]
+            return dc_power_antenn
         else:
-            id_antenn_max = list(dc_anten)[::-1][0]
-        # print(id_antenn_max)
-        return id_antenn_max
+            return list(dc_power_antenn)[::-1][0]
+
 
     def get_angle_rotate(self, antenn_id, angle):
         """ Находит дополнительное затухание из-за угла, дБ по заданному углу
